@@ -111,6 +111,22 @@ def rename_poll(pid: int, payload: dict = Body(...)):
         raise HTTPException(409, "that poll was closed while you were renaming it")
     return row
 
+@app.delete("/polls/{pid}", status_code=204)
+def delete_poll(pid: int):
+    c = cache.client()
+    # Same lock close() uses: a count in progress makes us back off, and a
+    # close() that starts while we delete backs off from us.
+    lock = f"lock:close:{pid}"
+    if not c.set(lock, "deleting", nx=True, ex=LOCK_TTL):
+        raise HTTPException(409, "a count is running for that poll - try again shortly")
+    try:
+        # Films, ballots and ballot_choices go with it (ON DELETE CASCADE).
+        if not db.one("DELETE FROM polls WHERE id=%s RETURNING id", (pid,)):
+            raise HTTPException(404, "no such poll")
+        cache.drop(f"poll:{pid}:first")  # Redis has no cascade
+    finally:
+        c.delete(lock)
+
 @app.post("/polls/{pid}/films", status_code=201)
 def add_film(pid: int, payload: dict = Body(...)):
     poll = _poll(pid)
