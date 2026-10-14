@@ -96,6 +96,20 @@ def show_poll(pid: int):
             "ballots_cast": db.one("SELECT count(*) AS n FROM ballots WHERE poll_id=%s",
                                    (pid,))["n"]}
 
+@app.patch("/polls/{pid}")
+def rename_poll(pid: int, payload: dict = Body(...)):
+    title = str(payload.get("title", "")).strip()
+    if not title:
+        raise HTTPException(400, "a poll needs a title")
+    if _poll(pid)["status"] != "open":
+        raise HTTPException(409, "that poll is closed - it can't be renamed")
+    # status='open' in the WHERE closes the gap between the check above and a
+    # close() that lands in between; zero rows back means we lost that race.
+    row = db.one("UPDATE polls SET title=%s WHERE id=%s AND status='open'"
+                 " RETURNING id, title, opened_by, status, created_at", (title, pid))
+    if not row:
+        raise HTTPException(409, "that poll was closed while you were renaming it")
+    return row
 
 @app.post("/polls/{pid}/films", status_code=201)
 def add_film(pid: int, payload: dict = Body(...)):
