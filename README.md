@@ -1,111 +1,138 @@
-# Movie Night Decider
-
-**Language:** Python (FastAPI) &nbsp;|&nbsp; **Needs:** Postgres + Redis
-
-This is a **starter**. The application already works. Your job is everything
-that gets it building, tested and running in CI.
-
 ---
 
-## You do not need Python installed
+# Delivery notes
 
-You will build this into a container, and the container brings its own
-Python 3.12. You are not being asked to extend the app — you are being asked
-to ship it.
+Everything below is what was added around the application: container, tests, pipeline,
+promotion flow and Kubernetes. The application code itself is the starter plus two endpoints
+(`PATCH /polls/{id}` to rename a poll and `DELETE /polls/{id}`) so that the API supports the
+full create / read / update / delete cycle.
 
----
-
-## 1. What this app needs
-
-| | |
-|---|---|
-| **Runtime** | Python 3.12 |
-| **Install dependencies** | `pip install -r requirements.txt` |
-| **Start the app** | `uvicorn app.main:app --host 0.0.0.0 --port 8080` |
-| **Listens on** | port 8080, bound to `0.0.0.0` |
-| **Environment variables** | `DATABASE_URL`, `REDIS_URL` |
-| **Needs running first** | Postgres, Redis, and the migrations applied |
-
-### What it does
-
-Someone opens a poll, everyone adds films and ranks them. When the poll closes the app runs a real instant-runoff count instead of just picking whatever had the most first-place votes, and shows you every elimination round - who went out, where their votes went, and what the majority bar was at the time.
-
-### Endpoints
-
-```
-GET  /health
-GET  /polls
-POST /polls                   {"title":"Friday night","opened_by":"asha"}
-GET  /polls/{id}              films, live first-preference counts, ballots cast
-POST /polls/{id}/films        {"title":"Dune: Part Two","added_by":"rahul"}
-POST /polls/{id}/ballots      {"voter":"asha","ranking":[3,1,2]}
-POST /polls/{id}/close        runs the count, exactly once
-GET  /polls/{id}/results      the stored round-by-round history
-```
-
-`/health` reports Postgres and Redis **separately**. If it says
-`postgres: false` the app started fine and your compose wiring is wrong —
-do not go looking in the application code.
-
-### Migrations
-
-`migrations/` holds `.sql` files applied **in filename order** before the app
-starts. They create the tables and insert sample data. A container running
-`psql` over them in order is enough; you do not need a migration tool.
-
----
-
-## 2. What you must write
-
-| File | What it has to do |
-|---|---|
-| `Dockerfile` | Install dependencies **before** copying source, pin the base image, do not run as root. |
-| `docker-compose.yml` | App + Postgres + Redis + a migration step, one `docker compose up`. |
-| `.circleci/config.yml` | lint → unit tests → integration tests → secret scan → image build |
-| Unit tests | For `app/voting.py`. No database, no network. |
-| Integration tests | Against a real Postgres and Redis as CircleCI service containers. |
-
-Then push your image to **your own Docker Hub account**, tagged `:1.0`.
-
-### When it works
+## Run it
 
 ```bash
-docker compose up --build
-curl localhost:8080/health
+docker compose up --build        # app + Postgres + Redis, migrations applied automatically
+curl -i localhost:8080/health    # 200 with postgres:true, redis:true
+curl localhost:8080/polls        # the three seeded polls
+bash scripts/crud-demo.sh        # create, read, update, delete, with the rows shown in Postgres
+docker compose down -v           # stop and delete the data volume
 ```
 
-```json
-{"status":"ok","postgres":true,"redis":true}
+`db` and `redis` have healthchecks. A one-shot `migrate` service applies `migrations/*.sql` in
+filename order and exits; the app waits for both databases to be healthy and for `migrate` to
+finish (`service_healthy` / `service_completed_successfully`). A fresh clone needs no other step.
+
+## Tests
+
+| | Command | What it covers |
+|---|---|---|
+| Unit | `python -m pytest tests/unit -v --cov=app.voting --cov-fail-under=70` | `app/voting.py` only: pure functions, no database, no network |
+| Integration | `python -m pytest tests/integration -v` | every endpoint, through FastAPI's in-process `TestClient`, against a real Postgres and a real Redis (no mocks) |
+
+Integration tests need `DATABASE_URL` and `REDIS_URL`. Locally:
+
+```bash
+docker run -d --rm --name pg-test -e POSTGRES_USER=app -e POSTGRES_PASSWORD=app -e POSTGRES_DB=app -p 5432:5432 postgres:16-alpine
+docker run -d --rm --name redis-test -p 6379:6379 redis:7-alpine
+export DATABASE_URL=postgresql://app:app@localhost:5432/app REDIS_URL=redis://localhost:6379
+python -m pytest tests/integration -v
 ```
 
----
+The unit job measures coverage of `app.voting` rather than all of `app/`, because `main.py`,
+`db.py` and `cache.py` need a database and are covered by the integration tests instead.
+The only unit-uncovered lines are the `last_standing` branch, which cannot be reached: a single
+surviving film always already holds a majority of the live ballots.
 
-## Where the marks are
+## How a tie is broken
 
-`app/voting.py` is **pure logic** — plain functions over plain data, no
-database and no HTTP. Start your tests there. Use pytest:
-`pytest --cov=app --cov-report=term-missing`. Minimum 70%.
+1. **Countback.** Look at the previous round, then the one before it, and eliminate whichever
+   tied film was weaker earliest.
+2. **Stable order.** If the films were level in every round, fall back to a fixed order, so the
+   same ballots always give the same result. It is never random.
 
-The seeded poll 1 is built so the plurality winner and the instant-runoff winner are different films, and so round one has a two-way tie at the bottom. Assert both. Then write the ugly ones: three films all tied, every ballot exhausting at once, a poll with one film, a poll with none.
+Two consequences worth stating plainly:
 
-## Why Redis is here
+- The fixed order compares film ids **as text**, so `"10"` sorts before `"9"`. That is
+  arbitrary, but it is deterministic, and it only applies after countback has failed. I chose
+  to keep this behaviour and pin it with three tests rather than change application behaviour;
+  switching to numeric order would mean updating those three tests.
+- The majority threshold is recomputed each round over the ballots still live, because a ballot
+  whose choices have all been eliminated is exhausted and counts for nobody. So the bar can fall
+  between rounds, which is correct: otherwise a round could end with nobody able to reach it.
 
-Two different jobs. A hash of live first-preference counts, so the room can watch the poll fill up without re-aggregating the ballots table on every refresh - it is warmed from Postgres if the cache is cold. And a `SET NX EX` lock around closing, so two people hitting Close at the same moment cannot both run the count. Note that the lock alone is not enough: it expires. The conditional `UPDATE ... WHERE status='open'` is what actually makes it exactly once.
+## Pipeline (CircleCI)
 
-## The hard part
-
-Ties at the bottom. Two films on two votes each - which goes out? Pick a rule and defend it.
-
-Write your answer in your README. It is worth more marks than the feature.
-
----
-
-## Getting unstuck
-
-| Symptom | Almost always |
+| Branch | What runs |
 |---|---|
-| `/health` says `postgres: false` | Wrong hostname. In compose the host is the **service name**, not `localhost`. |
-| Page will not load, logs fine | No `ports:` mapping, or bound to `127.0.0.1` not `0.0.0.0`. |
-| `relation "..." does not exist` | Migrations did not run, or the app started before they finished. |
-| Build takes minutes each time | `COPY . .` is above your dependency install. |
-| CI cannot reach the database | In CircleCI service containers the host **is** `localhost` — opposite of compose. |
+| `main` | secret scan -> lint -> unit tests -> integration tests -> build and push `:qa` |
+| `staging` | build and push `:stage` (no tests, the same code already passed on `main`) |
+| `prod` | build and push `:prod` |
+| any other branch | the four checks only, nothing is pushed |
+
+Each stage `requires` the previous one, so a failure stops everything after it. Every build
+pushes two tags: the moving one (`qa` / `stage` / `prod`, what Kubernetes follows) and an
+immutable `<branch>-<short-sha>`, which ties a running image back to a commit. Images are built
+for `linux/amd64` and `linux/arm64`, because CircleCI is amd64 and the machines the cluster runs
+on may be arm64. Docker Hub credentials are CircleCI project environment variables
+(`DOCKERHUB_USER`, `DOCKERHUB_TOKEN`); nothing secret is in the repository, and the secret scan
+checks the whole git history.
+
+## Branches and promotion
+
+`main` is QA, `staging` is pre-production, `prod` is production. A ruleset on all three blocks
+direct pushes, force pushes and deletion, with an empty bypass list. Work arrives on a branch
+and reaches `main` by pull request; promotion is `main` -> `staging` -> `prod`, always by pull
+request and always with **Create a merge commit** (squashing would rewrite the commits into
+new SHAs and leave the next promotion reporting conflicts). Right after a promotion
+`git diff origin/main origin/staging` and `git diff origin/staging origin/prod` are empty.
+
+## Kubernetes
+
+One namespace per environment (`qa`, `stage`, `prod`), manifests in `k8s/<namespace>/`, identical
+apart from the namespace and the image tag. Each namespace has Postgres, Redis and the app
+(two replicas), each behind a Service, plus a `dockerhub` pull secret referenced through
+`imagePullSecrets`. The app pulls `dapirs2006/movie-night-python:<qa|stage|prod>` with
+`imagePullPolicy: Always`.
+
+```bash
+kubectl apply -f k8s/qa/
+kubectl get pods,endpoints -n qa
+kubectl port-forward -n qa svc/movie-night 8090:8080
+```
+
+Choices worth knowing:
+
+- **Migrations** run in an init container on the app Pod, from a ConfigMap built out of
+  `migrations/`. It waits for Postgres, then applies the files inside a single `psql` session
+  holding an advisory lock. Without the lock, two Pods starting together on an empty database
+  collided on `CREATE TABLE`: in a local test, 6 of 12 starts failed without it and 0 of 20
+  failed with it.
+- **Readiness probe only** on `/health`. If Postgres is down, restarting the app would not help,
+  but taking it out of the Service is exactly right.
+- **No fixed `nodePort`**, so the three namespaces cannot collide.
+- **Postgres uses `emptyDir`**: data survives a container restart, not Pod deletion. The
+  migrations rebuild the schema and seed data on the next start, but polls created in the
+  meantime are lost. A PersistentVolumeClaim is the production answer.
+- The database credentials in the manifests are throwaway values for a cluster that exposes no
+  database port; real credentials would go in a Secret.
+
+### Release loop and proof of what is running
+
+```bash
+# merge a pull request into main -> CircleCI builds and pushes :qa -> then:
+kubectl rollout restart deployment/movie-night -n qa
+kubectl rollout status deployment/movie-night -n qa
+kubectl get pods -n qa -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}'
+kubectl describe pod -n qa -l app=movie-night | grep -i "image id"
+```
+
+`rollout restart` rebuilds nothing: it replaces the Pods one at a time, and
+`imagePullPolicy: Always` makes the new Pods pull whatever the tag points at now. The `Image ID`
+digest must equal the `Digest:` printed at the end of that pipeline's `build-push` log.
+
+## Known limitations
+
+- The integration tests call the app in-process rather than over real HTTP to a container; the
+  `docker compose` walkthrough and `scripts/crud-demo.sh` cover that path.
+- GitHub requires a pull request but does not require the checks to pass before merging; that
+  would be a "require status checks" rule on the ruleset.
+- Promotion rebuilds the image on each branch instead of promoting the exact tested image.
