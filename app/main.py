@@ -64,6 +64,9 @@ def _live_firsts(pid, films):
         return {int(k): int(v) for k, v in warm.items()}
     return {int(k): int(v) for k, v in raw.items()}
 
+@app.get("/version")
+def version():
+    return {"service": "movie-night", "version": "1.1.0"}
 
 @app.get("/polls")
 def list_polls():
