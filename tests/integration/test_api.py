@@ -313,3 +313,9 @@ def test_delete_works_on_a_closed_poll(client, make_poll, sql):
     pid = closed_poll(client, make_poll)
     assert client.delete(f"/polls/{pid}").status_code == 204
     assert sql("SELECT count(*) FROM ballots WHERE poll_id=%s", (pid,))[0][0] == 0
+
+
+def test_version_reports_service_and_version(client):
+    r = client.get("/version")
+    assert r.status_code == 200
+    assert r.json() == {"service": "movie-night", "version": "1.1.0"}
