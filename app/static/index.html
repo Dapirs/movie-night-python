@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Movie Night Decider</title>
+<style>
+:root{--bg:#fafaf9;--fg:#1c1917;--muted:#78716c;--card:#fff;--line:#e7e5e4;--accent:#b45309;--accent-bg:#fef3c7;--bad:#b91c1c;--good:#15803d}
+@media (prefers-color-scheme:dark){:root{--bg:#1c1917;--fg:#f5f5f4;--muted:#a8a29e;--card:#292524;--line:#44403c;--accent:#f59e0b;--accent-bg:#422006;--bad:#f87171;--good:#4ade80}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}
+header,main,#msg{max-width:640px;margin:0 auto;padding:12px 16px}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+#msg.err{color:var(--bad)} #msg.ok{color:var(--good)}
+a{color:var(--accent)}
+.brand{font-weight:700;color:var(--fg);text-decoration:none}
+h1{margin:.2em 0} h2{margin:1.4em 0 .2em;font-size:1.1rem} h3{margin:0 0 .2em;font-size:1rem}
+input{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);min-width:0}
+button{font:inherit;padding:8px 14px;border:1px solid var(--accent);border-radius:8px;background:transparent;color:var(--accent);cursor:pointer}
+button.primary{background:var(--accent);color:var(--bg);font-weight:600}
+button.quiet{border-color:var(--line);color:var(--muted)}
+.row{display:flex;gap:8px} .row input{flex:1}
+.top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.muted,small{color:var(--muted)}
+.card{display:block;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:10px 0;color:inherit;text-decoration:none}
+.poll small{display:block}
+.tag{font-size:.75rem;padding:1px 8px;border-radius:99px;border:1px solid var(--line);color:var(--muted)}
+.tag.open{color:var(--good);border-color:var(--good)}
+.films{list-style:none;padding:0;margin:8px 0}
+.film{display:grid;grid-template-columns:2rem 1fr 80px 1.5rem;align-items:center;gap:10px;width:100%;margin:6px 0;text-align:left;color:var(--fg);border-color:var(--line);background:var(--card)}
+.film.picked{border-color:var(--accent);background:var(--accent-bg)}
+.film .name small{display:block}
+.rank{display:grid;place-items:center;width:1.6rem;height:1.6rem;border-radius:50%;border:2px solid var(--line);font-weight:700;font-size:.85rem}
+.picked .rank{background:var(--accent);border-color:var(--accent);color:var(--bg)}
+.bar{position:relative;height:10px;background:var(--line);border-radius:5px}
+.bar i{display:block;height:100%;background:var(--accent);border-radius:5px}
+.bar u{position:absolute;top:-3px;bottom:-3px;border-left:2px dashed var(--fg);text-decoration:none}
+.n{text-align:right;color:var(--muted)}
+.banner{padding:14px;border-radius:12px;font-size:1.4rem;font-weight:700;text-align:center;margin:12px 0;background:var(--accent-bg);color:var(--accent)}
+.banner.none{background:var(--card);border:1px solid var(--line);color:var(--muted)}
+.callout{border-left:4px solid var(--accent);padding-left:12px}
+.trow{display:grid;grid-template-columns:9rem 1fr 2rem;gap:10px;align-items:center;margin:6px 0}
+.trow .name{overflow-wrap:anywhere}
+.trow.out .name{color:var(--bad);text-decoration:line-through} .trow.out .bar i{background:var(--bad)}
+.trow.won .name{color:var(--good);font-weight:700} .trow.won .bar i{background:var(--good)}
+.why{margin:.6em 0 0;color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<header>
+  <a href="#/" class="brand">Movie Night Decider</a>
+  <label>You are <input id="name" placeholder="your name"></label>
+</header>
+<div id="msg" role="alert" hidden></div>
+<main id="app"></main>
+
+<script>
+const app = document.getElementById('app');
+const msg = document.getElementById('msg');
+const nameEl = document.getElementById('name');
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+
+nameEl.value = localStorage.getItem('mn_name') || '';
+nameEl.addEventListener('input', () => localStorage.setItem('mn_name', nameEl.value));
+
+let nav = 0, timer = null, ranking = [], state = {poll: null};
+
+function flash(text, ok) { msg.textContent = text; msg.className = ok ? 'ok' : 'err'; msg.hidden = !text; }
+
+function who() {
+  const v = nameEl.value.trim();
+  if (!v) { flash('Put your name in the box at the top first.'); nameEl.focus(); }
+  return v;
+}
+
+async function api(path, method = 'GET', body) {
+  const r = await fetch(path, {method, headers: body ? {'Content-Type': 'application/json'} : {}, body: body && JSON.stringify(body)});
+  if (r.status === 204) return null;
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `Request failed (${r.status})`);
+  return data;
+}
+
+async function route() {
+  clearInterval(timer);
+  const token = ++nav;
+  const m = location.hash.match(/^#\/poll\/(\d+)$/);
+  try {
+    await (m ? pollView(+m[1], token) : home(token));
+  } catch (e) {
+    if (token !== nav) return;
+    app.innerHTML = '<p><a href="#/">&larr; All polls</a></p>';
+    flash(e.message);
+  }
+}
+
+async function home(token) {
+  const {polls} = await api('/polls');
+  if (token !== nav) return;
+  app.innerHTML = `
+    <form data-form="new-poll" class="row">
+      <input name="title" placeholder="What's the occasion? e.g. Friday night" required>
+      <button class="primary">Open a poll</button>
+    </form>
+    ${polls.length ? polls.slice().reverse().map(p => `
+      <a class="card poll" href="#/poll/${p.id}">
+        <strong>${esc(p.title)}</strong> <span class="tag ${p.status}">${p.status}</span>
+        <small>${plural(p.films, 'film')} · ${plural(p.ballots, 'ballot')} · opened by ${esc(p.opened_by)}</small>
+      </a>`).join('') : '<p class="muted">No polls yet. Open one above.</p>'}`;
+}
+
+async function pollView(id, token) {
+  const poll = await api(`/polls/${id}`);
+  if (token !== nav) return;
+  state.poll = poll;
+  if (poll.status === 'closed') return results(token);
+  ranking = [];
+  app.innerHTML = `
+    <p class="top"><a href="#/">&larr; All polls</a>
+      <span><button data-act="close">Close &amp; count</button> <button data-act="delete" class="quiet">Delete</button></span></p>
+    <h1>${esc(poll.title)}</h1>
+    <p class="muted" id="meta"></p>
+    <h2>Rank your picks</h2>
+    <p class="muted">Tap films in order of preference: your first tap is your favourite. Tap a ranked film again to drop it. You don't have to rank them all. The bar and number on each film show first-place votes so far.</p>
+    <ul id="films" class="films"></ul>
+    <form data-form="film" class="row"><input name="title" placeholder="Add a film" required><button class="quiet">Add</button></form>
+    <p><button data-act="vote" class="primary">Submit my ballot</button> <button data-act="clear" class="quiet">Clear</button></p>`;
+  renderFilms();
+  timer = setInterval(() => { if (!document.hidden) reload().catch(() => {}); }, 5000);
+}
+
+function renderFilms() {
+  const {films, ballots_cast, opened_by} = state.poll;
+  $('#meta').textContent = `Opened by ${opened_by} · ${plural(ballots_cast, 'ballot')} cast`;
+  $('#films').innerHTML = films.length ? films.map(f => {
+    const pos = ranking.indexOf(f.id) + 1;
+    const pct = ballots_cast ? 100 * f.first_preferences / ballots_cast : 0;
+    return `<li><button class="film ${pos ? 'picked' : ''}" data-film="${f.id}" aria-pressed="${!!pos}">
+      <span class="rank">${pos || ''}</span>
+      <span class="name">${esc(f.title)}<small>added by ${esc(f.added_by)}</small></span>
+      <span class="bar"><i style="width:${pct}%"></i></span>
+      <span class="n">${f.first_preferences}</span></button></li>`;
+  }).join('') : '<li class="muted">No films yet. Add the first one below.</li>';
+}
+
+async function reload() {
+  const poll = await api(`/polls/${state.poll.id}`);
+  if (poll.status === 'closed') return route();
+  state.poll = poll;
+  renderFilms();
+}
+
+async function results(token) {
+  const poll = state.poll;
+  const r = await api(`/polls/${poll.id}/results`);
+  if (token !== nav) return;
+  const headline = r.winner ? `${esc(r.winner)} wins`
+    : r.status === 'tie' ? 'Dead heat: no winner' : 'No winner: every ballot ran out of choices';
+  app.innerHTML = `
+    <p class="top"><a href="#/">&larr; All polls</a><button data-act="delete" class="quiet">Delete</button></p>
+    <h1>${esc(poll.title)}</h1>
+    <p class="muted">Closed · ${plural(poll.ballots_cast, 'ballot')} cast</p>
+    <div class="banner ${r.winner ? '' : 'none'}">${headline}</div>
+    ${r.winner && r.plurality_winner && r.irv_changed_the_answer ? `<p class="callout">Simply counting first-place votes would have picked <b>${esc(r.plurality_winner)}</b>. Counting the ranked ballots round by round changed the answer.</p>` : ''}
+    <h2>How the count went</h2>
+    ${r.rounds.map((rd, i) => round(rd, i === r.rounds.length - 1 ? r.winner : null)).join('')}`;
+}
+
+function round(rd, winner) {
+  const live = rd.active_ballots || 1;
+  const rows = Object.entries(rd.tallies).sort((a, b) => b[1] - a[1]);
+  return `<section class="card"><h3>Round ${rd.round}</h3>
+    <p class="muted">${plural(rd.active_ballots, 'live ballot')}${rd.exhausted_ballots ? `, ${rd.exhausted_ballots} exhausted` : ''}. Majority needed: ${rd.majority_needed} (dashed line).</p>
+    ${rows.map(([name, n]) => `
+      <div class="trow ${rd.eliminated.includes(name) ? 'out' : ''} ${name === winner ? 'won' : ''}">
+        <span class="name">${esc(name)}</span>
+        <span class="bar"><i style="width:${100 * n / live}%"></i><u style="left:${100 * rd.majority_needed / live}%"></u></span>
+        <span class="n">${n}</span>
+      </div>`).join('')}
+    <p class="why">${rd.eliminated.length ? `<b>Out: ${rd.eliminated.map(esc).join(', ')}.</b> ` : ''}${esc(rd.reason)}</p>
+  </section>`;
+}
+
+const actions = {
+  clear() { ranking = []; renderFilms(); },
+  async vote() {
+    const voter = who();
+    if (!voter) return;
+    if (!ranking.length) return flash('Tap at least one film first.');
+    await api(`/polls/${state.poll.id}/ballots`, 'POST', {voter, ranking});
+    ranking = [];
+    await reload();
+    flash(`Ballot recorded for ${voter}.`, true);
+  },
+  async close() {
+    if (!confirm("Close the poll and run the count? This can't be undone.")) return;
+    await api(`/polls/${state.poll.id}/close`, 'POST');
+    await route();
+    flash('Poll closed. Here is the count.', true);
+  },
+  async delete() {
+    if (!confirm('Delete this poll and all its ballots?')) return;
+    await api(`/polls/${state.poll.id}`, 'DELETE');
+    location.hash = '#/';
+  },
+};
+
+app.addEventListener('click', async e => {
+  const film = e.target.closest('[data-film]');
+  if (film) {
+    const id = +film.dataset.film;
+    ranking = ranking.includes(id) ? ranking.filter(x => x !== id) : [...ranking, id];
+    return renderFilms();
+  }
+  const act = e.target.closest('[data-act]');
+  if (!act) return;
+  try { await actions[act.dataset.act](); } catch (err) { flash(err.message); }
+});
+
+app.addEventListener('submit', async e => {
+  e.preventDefault();
+  const form = e.target, title = new FormData(form).get('title').trim();
+  try {
+    if (form.dataset.form === 'new-poll') {
+      const opened_by = who();
+      if (!opened_by) return;
+      const p = await api('/polls', 'POST', {title, opened_by});
+      location.hash = `#/poll/${p.id}`;
+    } else {
+      await api(`/polls/${state.poll.id}/films`, 'POST', {title, added_by: nameEl.value.trim() || 'anonymous'});
+      form.reset();
+      await reload();
+    }
+  } catch (err) { flash(err.message); }
+});
+
+addEventListener('hashchange', () => { flash(''); route(); });
+route();
+</script>
+</body>
+</html>
