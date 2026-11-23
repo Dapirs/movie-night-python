@@ -1,7 +1,8 @@
 import json
+from pathlib import Path
 
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from . import cache, db
 from .voting import BallotError, clean_ballot, count, describe
@@ -9,6 +10,12 @@ from .voting import BallotError, clean_ballot, count, describe
 app = FastAPI(title="movie-night")
 
 LOCK_TTL = 30
+INDEX = Path(__file__).parent / "static" / "index.html"
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(INDEX)
 
 
 @app.get("/health")
